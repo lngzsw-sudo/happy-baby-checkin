@@ -3,7 +3,8 @@
   'use strict';
 
   const CFG = window.APP_CONFIG || {};
-  const DEMO = !CFG.LIFF_ID || !CFG.GAS_URL;
+  // โหมดตัวอย่าง: เมื่อยังไม่ได้ตั้งค่า หรือเปิดด้วย ?demo=1 (ใช้ข้อมูลจำลอง ไม่แตะข้อมูลจริง)
+  const DEMO = !CFG.LIFF_ID || !CFG.GAS_URL || /[?&]demo=1(&|$)/.test(location.search);
   const TZ = 'Asia/Bangkok';
   const LEAVE_TYPES = { sick: 'ลาป่วย', personal: 'ลากิจ', vacation: 'ลาพักร้อน', other: 'อื่นๆ' };
   const LEAVE_STATUS = { pending: ['รออนุมัติ', 'warn'], approved: ['อนุมัติแล้ว', ''], rejected: ['ไม่อนุมัติ', 'bad'], cancelled: ['ยกเลิก', 'mute'] };
@@ -60,15 +61,31 @@
       throw new Error('เชื่อมต่อระบบไม่ได้ กรุณาตรวจอินเทอร์เน็ตแล้วลองใหม่');
     }
     if (!j.ok) {
-      if (j.code === 'TOKEN_INVALID' && window.liff && !window.liff.isInClient()) {
-        window.liff.logout();
-        location.reload();
-      }
+      if (j.code === 'TOKEN_INVALID' && relogin()) return new Promise(() => {}); // กำลังโหลดหน้าใหม่
       const err = new Error(j.error || 'เกิดข้อผิดพลาด');
       err.code = j.code;
       throw err;
     }
     return j.data;
+  }
+
+  /** ID token ของ LINE มีอายุราว 1 ชั่วโมง — ถ้าเปิดหน้าค้างไว้นานต้องขอใหม่ */
+  function tokenExpired() {
+    try {
+      const p = JSON.parse(atob(S.idToken.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+      return p.exp * 1000 < now().getTime() + 60000;
+    } catch (e) { return false; }
+  }
+  /** ล้างเซสชัน LINE แล้วโหลดหน้าใหม่เพื่อรับ token ใหม่ (ไม่เกิน 1 ครั้งต่อนาที กันวนซ้ำ) */
+  function relogin() {
+    if (DEMO || !window.liff) return false;
+    let last = 0;
+    try { last = Number(sessionStorage.getItem('relogin')) || 0; } catch (e) { /* ignore */ }
+    if (Date.now() - last < 60000) return false;
+    try { sessionStorage.setItem('relogin', String(Date.now())); } catch (e) { /* ignore */ }
+    try { window.liff.logout(); } catch (e) { /* ignore */ }
+    location.reload();
+    return true;
   }
 
   /* ---------- UI พื้นฐาน ---------- */
@@ -222,7 +239,7 @@
   function switchTab(tab) {
     S.tab = tab;
     document.querySelectorAll('.nav button').forEach((b) => b.classList.toggle('on', b.dataset.tab === tab));
-    if (tab !== 'checkin') { stopCamera(); clearInterval(S.clockTimer); }
+    if (tab !== 'checkin') { stopCamera(); stopGeo(); clearInterval(S.clockTimer); }
     window.scrollTo(0, 0);
     const r = { checkin: renderCheckin, history: renderHistory, leave: renderLeave, admin: renderAdmin }[tab];
     Promise.resolve(r()).catch(fail);
@@ -256,10 +273,17 @@
 
     clearInterval(S.clockTimer);
     S.clockTimer = setInterval(() => { const c = $('#clock'); if (c) c.textContent = fmtTime(now()); }, 500);
-    if (!next) { stopCamera(); return; }
+    if (!next) { stopCamera(); stopGeo(); return; }
     startGeo();
     updateLoc();
     startCamera();
+    $('#loc').addEventListener('click', () => { // แตะแถบตำแหน่งเพื่อเริ่มค้นหาใหม่
+      if (S.pos && !S.posErr) return;
+      stopGeo();
+      S.posErr = '';
+      startGeo();
+      updateLoc();
+    });
     $('#shoot').addEventListener('click', () => onShoot(next));
     $('#file').addEventListener('change', (ev) => onFile(ev, next));
   }
@@ -267,11 +291,23 @@
   function startGeo() {
     if (S.watchId !== null) return;
     if (!navigator.geolocation) { S.posErr = 'อุปกรณ์นี้ไม่รองรับการระบุตำแหน่ง'; return; }
+    S.geoStart = Date.now();
+    clearTimeout(S.geoHint);
+    S.geoHint = setTimeout(updateLoc, 8500); // ถ้ายังไม่ได้พิกัด ให้ขึ้นคำแนะนำ
+    // ขอพิกัดแบบเร็ว (Wi-Fi/เสาสัญญาณ) ก่อน แล้วให้ GPS ความแม่นยำสูงปรับค่าตามมา — ในอาคาร GPS อาจใช้เวลานาน
+    navigator.geolocation.getCurrentPosition((p) => { if (!S.pos) setPos(p); }, () => {},
+      { enableHighAccuracy: false, maximumAge: 60000, timeout: 10000 });
     S.watchId = navigator.geolocation.watchPosition(setPos, (err) => {
       if (DEMO) { S.pos = { lat: S.me.shop.lat + 0.0002, lng: S.me.shop.lng + 0.0001, acc: 12 }; updateLoc(); return; }
-      S.posErr = err.code === 1 ? 'กรุณาอนุญาตให้ LINE เข้าถึงตำแหน่ง แล้วเปิดหน้านี้ใหม่' : 'ยังหาตำแหน่งไม่ได้ กรุณาเปิด GPS';
+      if (err.code === 1) S.posErr = '🚫 ยังไม่ได้อนุญาตตำแหน่ง — เปิด ตั้งค่า > LINE > ตำแหน่ง เลือก "ขณะใช้แอป" แล้วแตะที่นี่';
+      else if (!S.pos) S.posErr = 'ยังหาตำแหน่งไม่ได้ กรุณาเปิด GPS แล้วแตะที่นี่เพื่อลองใหม่';
       updateLoc();
     }, { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 });
+  }
+  function stopGeo() {
+    clearTimeout(S.geoHint);
+    if (S.watchId !== null && navigator.geolocation) navigator.geolocation.clearWatch(S.watchId);
+    S.watchId = null;
   }
   function setPos(p) {
     S.pos = { lat: p.coords.latitude, lng: p.coords.longitude, acc: Math.round(p.coords.accuracy) };
@@ -296,7 +332,14 @@
     const el = $('#loc');
     if (!el) return;
     const i = posInfo();
-    if (!i) { el.className = 'loc' + (S.posErr ? ' bad' : ''); el.textContent = S.posErr || 'กำลังค้นหาตำแหน่ง…'; return; }
+    if (!i) {
+      const slow = Date.now() - (S.geoStart || 0) > 8000;
+      el.className = 'loc' + (S.posErr ? ' bad' : '');
+      el.textContent = S.posErr || (slow
+        ? 'กำลังค้นหาตำแหน่ง… ถ้านานเกินไป ตรวจว่าเปิดตำแหน่งให้ LINE แล้ว (ตั้งค่า > LINE > ตำแหน่ง) แล้วแตะที่นี่เพื่อลองใหม่'
+        : 'กำลังค้นหาตำแหน่ง…');
+      return;
+    }
     if (i.lowAcc) { el.className = 'loc bad'; el.textContent = '📡 สัญญาณ GPS ยังไม่แม่นยำ (±' + S.pos.acc + ' ม.) กรุณารอสักครู่'; return; }
     el.className = 'loc ' + (i.inArea ? 'ok' : 'bad');
     el.textContent = i.inArea ? '📍 อยู่ในพื้นที่ร้าน • ห่าง ' + i.d + ' ม. (±' + S.pos.acc + ' ม.)'
@@ -306,6 +349,8 @@
   async function startCamera() {
     const msg = $('#camMsg');
     try {
+      // หลังพักจอ/สลับแอป iOS จะปิดกล้องเอง → ต้องขอสตรีมใหม่ ไม่เช่นนั้นภาพจะดำ
+      if (S.stream && !S.stream.getVideoTracks().some((t) => t.readyState === 'live')) stopCamera();
       if (!S.stream) {
         const st = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 1280 } }, audio: false });
         if (S.tab !== 'checkin' || !$('#video')) { st.getTracks().forEach((t) => t.stop()); return; }
@@ -670,7 +715,10 @@
 
   document.addEventListener('visibilitychange', () => {
     // กลับมาที่หน้าจอหลังข้ามวัน/พักเครื่อง → โหลดสถานะล่าสุด
-    if (!document.hidden && S.me && S.me.employee && S.me.employee.status === 'active' && S.tab === 'checkin' && !modalRoot.innerHTML) {
+    if (document.hidden || !S.me || !S.me.employee || S.me.employee.status !== 'active' || modalRoot.innerHTML) return;
+    if (tokenExpired() && relogin()) return;
+    if (S.tab === 'checkin') {
+      stopGeo(); // การติดตามตำแหน่งมักหยุดเองระหว่างพักจอ → เริ่มใหม่
       refreshMe().then(renderCheckin).catch(() => {});
     }
   });

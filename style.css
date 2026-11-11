@@ -73,6 +73,7 @@ main, #av, #sf { grid-template-columns: minmax(0, 1fr); }
 .badges { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
 
 .loc { font-size: 14px; padding: 10px 12px; border-radius: 12px; background: #f6f1f3; color: var(--muted); margin-bottom: 12px; }
+.loc { cursor: pointer; }
 .loc.ok { background: var(--mint-soft); color: var(--mint); font-weight: 600; }
 .loc.bad { background: var(--red-soft); color: var(--red); font-weight: 600; }
 
